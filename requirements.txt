@@ -1,0 +1,3 @@
+camoufox[geoip]
+beautifulsoup4
+requests
