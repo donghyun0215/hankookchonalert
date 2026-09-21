@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-hankookchon.com/job_b 새 글 감지 → 텔레그램 알림.
-Cloudflare 차단 때문에 Camoufox(스텔스 Firefox)로 페이지를 연다.
+hankookchon.com/job_b 새 글 감지 → 텔레그램 알림. (v2)
+v2 변경점: headless="virtual" (Xvfb 가상 디스플레이) + 브라우저 2회 재시도
+          + Turnstile 체크박스 클릭 시도 → Cloudflare 통과율 개선
 
 env:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (GitHub Secrets)
@@ -32,6 +33,9 @@ NAV_TITLES = {"구인", "구직", "구인구직", "목록", "다음", "이전", 
 
 FAIL_ALERT_AT = 3          # 연속 실패 n회째에 경고 1번
 FAIL_ALERT_EVERY = 48      # 이후 n회마다 다시 경고 (30분 주기면 ~하루)
+
+BROWSER_ATTEMPTS = 2       # 실행당 브라우저 재시도 횟수
+CHALLENGE_WAIT_SEC = 100   # 시도당 챌린지 해결 대기 시간
 
 
 def tg_send(text: str, silent: bool = False) -> bool:
@@ -65,7 +69,6 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # seen 무한 증식 방지 (최근 1000개만 유지)
     state["seen"] = state["seen"][-1000:]
     STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8"
@@ -82,29 +85,65 @@ def is_challenge(html: str, title: str) -> bool:
     )
 
 
+def try_click_turnstile(page) -> None:
+    """CF 체크박스형 챌린지일 경우 위젯 클릭 시도 (best-effort)."""
+    try:
+        frames = page.frames
+        for f in frames:
+            if "challenges.cloudflare.com" in (f.url or ""):
+                # iframe 요소 자체의 위치를 찾아 좌측 체크박스 부근 클릭
+                el = page.query_selector("iframe[src*='challenges.cloudflare.com']")
+                if el:
+                    box = el.bounding_box()
+                    if box:
+                        page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                        print("[info] clicked turnstile area")
+                        return
+    except Exception as e:
+        print("[info] turnstile click attempt failed:", e)
+
+
 def fetch_board_html() -> str | None:
-    """Camoufox로 페이지를 열고 CF 챌린지가 풀릴 때까지 대기."""
+    """Camoufox(가상 디스플레이)로 페이지를 열고 CF 챌린지가 풀릴 때까지 대기."""
     from camoufox.sync_api import Camoufox
 
-    with Camoufox(headless=True, humanize=True, os="windows", geoip=True) as browser:
-        page = browser.new_page()
-        page.goto(BOARD_URL, wait_until="domcontentloaded", timeout=90_000)
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            html = page.content()
-            title = page.title()
-            if not is_challenge(html, title):
-                print(f"[ok] challenge passed, title={title!r}, len={len(html)}")
-                return html
-            time.sleep(4)
-        # 실패: 디버그용으로 저장
-        DEBUG_HTML.write_text(page.content(), encoding="utf-8")
-        print("[fail] cloudflare challenge not solved within 120s")
-        return None
+    last_html = ""
+    for attempt in range(1, BROWSER_ATTEMPTS + 1):
+        print(f"[info] browser attempt {attempt}/{BROWSER_ATTEMPTS}")
+        try:
+            with Camoufox(
+                headless="virtual",  # Xvfb 가상 디스플레이 — CF headless 탐지 회피
+                humanize=True,
+                os="windows",
+                geoip=True,
+            ) as browser:
+                page = browser.new_page()
+                page.goto(BOARD_URL, wait_until="domcontentloaded", timeout=90_000)
+                deadline = time.time() + CHALLENGE_WAIT_SEC
+                clicked = False
+                while time.time() < deadline:
+                    last_html = page.content()
+                    title = page.title()
+                    if not is_challenge(last_html, title):
+                        print(f"[ok] challenge passed, title={title!r}, len={len(last_html)}")
+                        return last_html
+                    # 15초쯤 기다려도 안 풀리면 체크박스 클릭 1회 시도
+                    if not clicked and time.time() > deadline - CHALLENGE_WAIT_SEC + 15:
+                        try_click_turnstile(page)
+                        clicked = True
+                    time.sleep(4)
+                print(f"[fail] attempt {attempt}: challenge not solved in {CHALLENGE_WAIT_SEC}s")
+        except Exception as e:
+            print(f"[error] attempt {attempt} exception:", e)
+        time.sleep(3)
+
+    if last_html:
+        DEBUG_HTML.write_text(last_html, encoding="utf-8")
+    return None
 
 
 def parse_posts(html: str) -> list[dict]:
-    """게시판 HTML에서 (id, title, url) 추출. 보드 구조를 모를 수 있어 휴리스틱 파서."""
+    """게시판 HTML에서 (id, title, url) 추출. 휴리스틱 파서."""
     soup = BeautifulSoup(html, "html.parser")
     posts, seen_urls = [], set()
 
@@ -113,16 +152,14 @@ def parse_posts(html: str) -> list[dict]:
         if "job_b" not in href:
             continue
         url = urljoin(BOARD_URL, href)
-        # 개별 글로 보이는 패턴: view/uid/idx/no/wr_id/document_srl 또는 /job_b/숫자
         if not re.search(r"(view|uid=|idx=|no=|wr_id=|document_srl|bmode=|/job_b/\d+)", url, re.I):
             continue
         title = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
         if len(title) < 4 or title in NAV_TITLES or re.fullmatch(r"[\d\s./-]+", title):
-            continue  # 페이지 번호, 날짜, 네비게이션 제외
+            continue
         if url in seen_urls:
             continue
         seen_urls.add(url)
-        # id: URL의 숫자 파라미터 우선, 없으면 URL 자체
         m = re.search(r"(?:uid|idx|no|wr_id|document_srl)=(\d+)", url) or re.search(
             r"/job_b/(\d+)", url
         )
@@ -150,7 +187,7 @@ def main() -> int:
                 silent=True,
             )
         save_state(state)
-        return 0  # 워크플로 자체는 성공 처리 (state 커밋 위해)
+        return 0
 
     posts = parse_posts(html)
     print(f"[info] parsed {len(posts)} posts")
@@ -158,7 +195,6 @@ def main() -> int:
         print("   -", p["id"], "|", p["title"][:50])
 
     if len(posts) < 3:
-        # 파싱 실패로 간주 (구조 변경 or 챌린지 오탐)
         DEBUG_HTML.write_text(html, encoding="utf-8")
         state["fail_count"] += 1
         if state["fail_count"] == FAIL_ALERT_AT:
@@ -175,7 +211,6 @@ def main() -> int:
     new_posts = [p for p in posts if p["id"] not in seen]
 
     if not state.get("seeded"):
-        # 첫 실행: 현재 글들을 기준선으로만 저장, 알림 폭탄 방지
         state["seen"].extend(p["id"] for p in posts)
         state["seeded"] = True
         save_state(state)
@@ -187,13 +222,12 @@ def main() -> int:
         return 0
 
     if new_posts:
-        # 오래된 것부터 알림 (목록은 보통 최신순이므로 역순)
         for p in reversed(new_posts):
             hot = bool(HOT_KEYWORDS.search(p["title"]))
             prefix = "🎙️ <b>통역 공고!</b>\n" if hot else "📌 새 구인 공고\n"
             tg_send(
                 f"{prefix}<b>{p['title']}</b>\n{p['url']}",
-                silent=not hot,  # 통역 공고만 소리 알림, 나머지는 무음 알림
+                silent=not hot,
             )
             time.sleep(1)
         state["seen"].extend(p["id"] for p in new_posts)
